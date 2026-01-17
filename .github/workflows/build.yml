@@ -1,0 +1,160 @@
+name: build-dnscrypt-proxy
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Label versi untuk nama file (opsional). Kalau kosong & tag build, pakai nama tag. Kalau manual kosong, pakai 'manual'."
+        required: false
+        default: ""
+      release_tag:
+        description: "Tag release yang dibuat/diupdate (opsional). Kalau kosong & tag build, pakai tag itu. Kalau manual kosong, pakai 'manual-up_<sha7>'."
+        required: false
+        default: ""
+      prerelease:
+        description: "Untuk manual: prerelease?"
+        type: boolean
+        required: false
+        default: true
+      draft:
+        description: "Untuk manual: draft?"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux-amd64:
+    runs-on: ubuntu-latest
+    env:
+      GOOS: linux
+      GOARCH: amd64
+      CGO_ENABLED: "0"
+
+    steps:
+      # Checkout repo kamu (nggak wajib, tapi aman kalau kamu mau generate notes dll)
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Clone dnscrypt-proxy into ./src (as per wiki)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf src
+          git clone --depth=1 https://github.com/DNSCrypt/dnscrypt-proxy src
+          test -d src/dnscrypt-proxy
+
+      - name: Set up Go (stable)
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: true
+          cache-dependency-path: |
+            src/go.sum
+
+      - name: Compute metadata (version, upstream sha, release tag, asset name)
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          UP_SHA="$(git -C src rev-parse --short=7 HEAD)"
+
+          # version label:
+          # - kalau event tag: pakai nama tag
+          # - kalau manual dan input version diisi: pakai itu
+          # - kalau manual kosong: "manual"
+          VERSION_INPUT="${{ github.event.inputs.version }}"
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && -n "${GITHUB_REF_NAME:-}" ]]; then
+            VERSION_LABEL="${GITHUB_REF_NAME}"
+          elif [[ -n "${VERSION_INPUT}" ]]; then
+            VERSION_LABEL="${VERSION_INPUT}"
+          else
+            VERSION_LABEL="manual"
+          fi
+
+          # release tag:
+          # - kalau event tag: pakai nama tag
+          # - kalau manual dan input release_tag diisi: pakai itu
+          # - kalau manual kosong: manual-up_<upstreamsha>
+          RELTAG_INPUT="${{ github.event.inputs.release_tag }}"
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && -n "${GITHUB_REF_NAME:-}" ]]; then
+            RELEASE_TAG="${GITHUB_REF_NAME}"
+            IS_PRERELEASE="false"
+            IS_DRAFT="false"
+          else
+            if [[ -n "${RELTAG_INPUT}" ]]; then
+              RELEASE_TAG="${RELTAG_INPUT}"
+            else
+              RELEASE_TAG="manual-up_${UP_SHA}"
+            fi
+            IS_PRERELEASE="${{ github.event.inputs.prerelease }}"
+            IS_DRAFT="${{ github.event.inputs.draft }}"
+            [[ -z "${IS_PRERELEASE}" ]] && IS_PRERELEASE="true"
+            [[ -z "${IS_DRAFT}" ]] && IS_DRAFT="false"
+          fi
+
+          ASSET_BASE="dnscrypt-proxy-${VERSION_LABEL}-up_${UP_SHA}-linux-amd64"
+          TAR_NAME="${ASSET_BASE}.tar.gz"
+
+          echo "up_sha=${UP_SHA}" >> "$GITHUB_OUTPUT"
+          echo "version_label=${VERSION_LABEL}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "asset_base=${ASSET_BASE}" >> "$GITHUB_OUTPUT"
+          echo "tar_name=${TAR_NAME}" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=${IS_PRERELEASE}" >> "$GITHUB_OUTPUT"
+          echo "is_draft=${IS_DRAFT}" >> "$GITHUB_OUTPUT"
+
+      - name: Build dnscrypt-proxy (linux/amd64)
+        working-directory: src/dnscrypt-proxy
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          echo "Building -> dist/dnscrypt-proxy"
+          go build -ldflags="-s -w" -mod=vendor -o dist/dnscrypt-proxy .
+
+          ls -lah dist
+          file dist/dnscrypt-proxy || true
+
+      - name: Package (tar.gz) with clear name
+        working-directory: src/dnscrypt-proxy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          mv dnscrypt-proxy "${{ steps.meta.outputs.asset_base }}"
+          tar -czf "${{ steps.meta.outputs.tar_name }}" "${{ steps.meta.outputs.asset_base }}"
+          ls -lah
+
+      - name: Create release notes (include upstream commit)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > release_notes.md << 'EOF'
+          Build artifacts for dnscrypt-proxy (linux/amd64).
+
+          - Upstream repo: DNSCrypt/dnscrypt-proxy
+          - Upstream commit: ${{ steps.meta.outputs.up_sha }}
+          - Built with Go: (see workflow logs)
+          EOF
+
+      - name: Create/Update GitHub Release and upload asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.release_tag }}
+          name: dnscrypt-proxy ${{ steps.meta.outputs.version_label }} (up_${{ steps.meta.outputs.up_sha }})
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ steps.meta.outputs.is_prerelease == 'true' }}
+          draft: ${{ steps.meta.outputs.is_draft == 'true' }}
+          body_path: release_notes.md
+          files: |
+            src/dnscrypt-proxy/dist/${{ steps.meta.outputs.tar_name }}
