@@ -37,7 +37,6 @@ jobs:
       CGO_ENABLED: "0"
 
     steps:
-      # Checkout repo kamu (nggak wajib, tapi aman kalau kamu mau generate notes dll)
       - name: Checkout this repo
         uses: actions/checkout@v4
         with:
@@ -67,10 +66,6 @@ jobs:
 
           UP_SHA="$(git -C src rev-parse --short=7 HEAD)"
 
-          # version label:
-          # - kalau event tag: pakai nama tag
-          # - kalau manual dan input version diisi: pakai itu
-          # - kalau manual kosong: "manual"
           VERSION_INPUT="${{ github.event.inputs.version }}"
           if [[ "${GITHUB_REF_TYPE:-}" == "tag" && -n "${GITHUB_REF_NAME:-}" ]]; then
             VERSION_LABEL="${GITHUB_REF_NAME}"
@@ -80,10 +75,6 @@ jobs:
             VERSION_LABEL="manual"
           fi
 
-          # release tag:
-          # - kalau event tag: pakai nama tag
-          # - kalau manual dan input release_tag diisi: pakai itu
-          # - kalau manual kosong: manual-up_<upstreamsha>
           RELTAG_INPUT="${{ github.event.inputs.release_tag }}"
           if [[ "${GITHUB_REF_TYPE:-}" == "tag" && -n "${GITHUB_REF_NAME:-}" ]]; then
             RELEASE_TAG="${GITHUB_REF_NAME}"
@@ -125,17 +116,29 @@ jobs:
           ls -lah dist
           file dist/dnscrypt-proxy || true
 
-      - name: Package (tar.gz) with clear name
+      - name: Prepare assets (binary + tar.gz + sha256)
         working-directory: src/dnscrypt-proxy
         shell: bash
         run: |
           set -euo pipefail
           cd dist
-          mv dnscrypt-proxy "${{ steps.meta.outputs.asset_base }}"
-          tar -czf "${{ steps.meta.outputs.tar_name }}" "${{ steps.meta.outputs.asset_base }}"
+
+          BIN="${{ steps.meta.outputs.asset_base }}"
+          TAR="${{ steps.meta.outputs.tar_name }}"
+
+          # rename binary
+          mv dnscrypt-proxy "${BIN}"
+
+          # tarball
+          tar -czf "${TAR}" "${BIN}"
+
+          # checksums (format: "<sha256>  <filename>")
+          sha256sum "${BIN}" > "${BIN}.sha256"
+          sha256sum "${TAR}" > "${TAR}.sha256"
+
           ls -lah
 
-      - name: Create release notes (include upstream commit)
+      - name: Release notes (include upstream commit)
         shell: bash
         run: |
           set -euo pipefail
@@ -144,10 +147,13 @@ jobs:
 
           - Upstream repo: DNSCrypt/dnscrypt-proxy
           - Upstream commit: ${{ steps.meta.outputs.up_sha }}
-          - Built with Go: (see workflow logs)
+
+          Verification (SHA256):
+          - Use the provided .sha256 files, e.g.:
+            sha256sum -c <file>.sha256
           EOF
 
-      - name: Create/Update GitHub Release and upload asset
+      - name: Create/Update GitHub Release and upload assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.meta.outputs.release_tag }}
@@ -157,4 +163,7 @@ jobs:
           draft: ${{ steps.meta.outputs.is_draft == 'true' }}
           body_path: release_notes.md
           files: |
+            src/dnscrypt-proxy/dist/${{ steps.meta.outputs.asset_base }}
+            src/dnscrypt-proxy/dist/${{ steps.meta.outputs.asset_base }}.sha256
             src/dnscrypt-proxy/dist/${{ steps.meta.outputs.tar_name }}
+            src/dnscrypt-proxy/dist/${{ steps.meta.outputs.tar_name }}.sha256
