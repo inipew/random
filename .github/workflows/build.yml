@@ -1,4 +1,4 @@
-name: build-dnscrypt-proxy
+name: build-dnscrypt-proxy-and-caddy
 
 on:
   push:
@@ -7,18 +7,18 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Label versi untuk nama file (opsional). Kalau kosong & tag build, pakai nama tag. Kalau manual kosong, pakai 'manual'."
+        description: "Label versi untuk release (opsional). Kalau kosong & tag build, pakai nama tag. Kalau manual kosong, pakai 'manual'."
         required: false
         default: ""
       release_tag:
-        description: "Tag release yang dibuat/diupdate (opsional). Kalau kosong & tag build, pakai tag itu. Kalau manual kosong, pakai 'manual-up_<sha7>'."
+        description: "Tag release yang dibuat/diupdate (opsional). Kalau kosong & tag build, pakai tag itu. Kalau manual kosong, auto-generate."
         required: false
         default: ""
       prerelease:
         description: "Untuk manual: prerelease?"
         type: boolean
         required: false
-        default: true
+        default: false
       draft:
         description: "Untuk manual: draft?"
         type: boolean
@@ -29,43 +29,44 @@ permissions:
   contents: write
 
 jobs:
-  build-linux-amd64:
+  meta:
     runs-on: ubuntu-latest
-    env:
-      GOOS: linux
-      GOARCH: amd64
-      CGO_ENABLED: "0"
+    outputs:
+      version_label: ${{ steps.meta.outputs.version_label }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
+      is_draft: ${{ steps.meta.outputs.is_draft }}
+
+      dns_sha: ${{ steps.meta.outputs.dns_sha }}
+      dns_sha_full: ${{ steps.meta.outputs.dns_sha_full }}
+      dns_tar_name: ${{ steps.meta.outputs.dns_tar_name }}
+
+      caddy_sha: ${{ steps.meta.outputs.caddy_sha }}
+      caddy_sha_full: ${{ steps.meta.outputs.caddy_sha_full }}
+      caddy_tar_name: ${{ steps.meta.outputs.caddy_tar_name }}
 
     steps:
-      - name: Checkout this repo
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Clone dnscrypt-proxy into ./src (as per wiki)
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf src
-          git clone --depth=1 https://github.com/DNSCrypt/dnscrypt-proxy src
-          test -d src/dnscrypt-proxy
-
-      - name: Set up Go (stable)
-        uses: actions/setup-go@v5
-        with:
-          go-version: "stable"
-          cache: true
-          cache-dependency-path: |
-            src/go.sum
-
-      - name: Compute metadata (version, upstream sha, release tag, asset name)
+      - name: Compute metadata (pin upstream commits + naming)
         id: meta
         shell: bash
         run: |
           set -euo pipefail
 
-          UP_SHA="$(git -C src rev-parse --short=7 HEAD)"
+          # dnscrypt-proxy upstream HEAD commit
+          rm -rf src
+          git clone --depth=1 https://github.com/DNSCrypt/dnscrypt-proxy src
+          DNS_SHA_FULL="$(git -C src rev-parse HEAD)"
+          DNS_SHA="${DNS_SHA_FULL:0:7}"
 
+          # caddy upstream HEAD commit
+          CADDY_SHA_FULL="$(git ls-remote https://github.com/caddyserver/caddy HEAD | awk '{print $1}')"
+          if [[ -z "${CADDY_SHA_FULL}" ]]; then
+            echo "Failed to resolve caddy HEAD commit" >&2
+            exit 1
+          fi
+          CADDY_SHA="${CADDY_SHA_FULL:0:7}"
+
+          # version label
           VERSION_INPUT="${{ github.event.inputs.version }}"
           if [[ "${GITHUB_REF_TYPE:-}" == "tag" && -n "${GITHUB_REF_NAME:-}" ]]; then
             VERSION_LABEL="${GITHUB_REF_NAME}"
@@ -75,6 +76,7 @@ jobs:
             VERSION_LABEL="manual"
           fi
 
+          # release tag
           RELTAG_INPUT="${{ github.event.inputs.release_tag }}"
           if [[ "${GITHUB_REF_TYPE:-}" == "tag" && -n "${GITHUB_REF_NAME:-}" ]]; then
             RELEASE_TAG="${GITHUB_REF_NAME}"
@@ -84,7 +86,7 @@ jobs:
             if [[ -n "${RELTAG_INPUT}" ]]; then
               RELEASE_TAG="${RELTAG_INPUT}"
             else
-              RELEASE_TAG="manual-up_${UP_SHA}"
+              RELEASE_TAG="manual-dns_${DNS_SHA}-caddy_${CADDY_SHA}"
             fi
             IS_PRERELEASE="${{ github.event.inputs.prerelease }}"
             IS_DRAFT="${{ github.event.inputs.draft }}"
@@ -92,16 +94,50 @@ jobs:
             [[ -z "${IS_DRAFT}" ]] && IS_DRAFT="false"
           fi
 
-          ASSET_BASE="dnscrypt-proxy-${VERSION_LABEL}-up_${UP_SHA}-linux-amd64"
-          TAR_NAME="${ASSET_BASE}.tar.gz"
+          DNS_TAR="dnscrypt-proxy-${VERSION_LABEL}-up_${DNS_SHA}-linux-amd64.tar.gz"
+          CADDY_TAR="caddy-${VERSION_LABEL}-up_${CADDY_SHA}-linux-amd64.tar.gz"
 
-          echo "up_sha=${UP_SHA}" >> "$GITHUB_OUTPUT"
-          echo "version_label=${VERSION_LABEL}" >> "$GITHUB_OUTPUT"
-          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
-          echo "asset_base=${ASSET_BASE}" >> "$GITHUB_OUTPUT"
-          echo "tar_name=${TAR_NAME}" >> "$GITHUB_OUTPUT"
-          echo "is_prerelease=${IS_PRERELEASE}" >> "$GITHUB_OUTPUT"
-          echo "is_draft=${IS_DRAFT}" >> "$GITHUB_OUTPUT"
+          {
+            echo "version_label=${VERSION_LABEL}"
+            echo "release_tag=${RELEASE_TAG}"
+            echo "is_prerelease=${IS_PRERELEASE}"
+            echo "is_draft=${IS_DRAFT}"
+
+            echo "dns_sha=${DNS_SHA}"
+            echo "dns_sha_full=${DNS_SHA_FULL}"
+            echo "dns_tar_name=${DNS_TAR}"
+
+            echo "caddy_sha=${CADDY_SHA}"
+            echo "caddy_sha_full=${CADDY_SHA_FULL}"
+            echo "caddy_tar_name=${CADDY_TAR}"
+          } >> "$GITHUB_OUTPUT"
+
+  build_dnscrypt:
+    runs-on: ubuntu-latest
+    needs: meta
+    env:
+      GOOS: linux
+      GOARCH: amd64
+      CGO_ENABLED: "0"
+    steps:
+      - name: Clone dnscrypt-proxy (pinned commit)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf src
+          git clone --depth=1 https://github.com/DNSCrypt/dnscrypt-proxy src
+          git -C src fetch --depth=1 origin "${{ needs.meta.outputs.dns_sha_full }}"
+          git -C src checkout "${{ needs.meta.outputs.dns_sha_full }}"
+          test -d src/dnscrypt-proxy
+
+      - name: Set up Go (stable)
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: true
+          cache-dependency-path: |
+            src/go.mod
+            src/go.sum
 
       - name: Build dnscrypt-proxy (linux/amd64)
         working-directory: src/dnscrypt-proxy
@@ -109,61 +145,149 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-
-          echo "Building -> dist/dnscrypt-proxy"
           go build -ldflags="-s -w" -mod=vendor -o dist/dnscrypt-proxy .
-
           ls -lah dist
-          file dist/dnscrypt-proxy || true
 
-      - name: Prepare assets (binary + tar.gz + sha256)
-        working-directory: src/dnscrypt-proxy
+      - name: Prepare release assets (clean binary name + tarball)
         shell: bash
         run: |
           set -euo pipefail
-          cd dist
+          mkdir -p release_assets
 
-          BIN="${{ steps.meta.outputs.asset_base }}"
-          TAR="${{ steps.meta.outputs.tar_name }}"
+          # clean binary name (no suffix)
+          cp src/dnscrypt-proxy/dist/dnscrypt-proxy release_assets/dnscrypt-proxy
 
-          # rename binary
-          mv dnscrypt-proxy "${BIN}"
+          # tarball keeps traceability in its filename, but inside contains clean binary name
+          (cd release_assets && tar -czf "${{ needs.meta.outputs.dns_tar_name }}" dnscrypt-proxy)
 
-          # tarball
-          tar -czf "${TAR}" "${BIN}"
+          ls -lah release_assets
 
-          # checksums (format: "<sha256>  <filename>")
-          sha256sum "${BIN}" > "${BIN}.sha256"
-          sha256sum "${TAR}" > "${TAR}.sha256"
+      - name: Upload build artifacts (dnscrypt)
+        uses: actions/upload-artifact@v4
+        with:
+          name: release_assets_dnscrypt
+          path: release_assets/*
+
+  build_caddy:
+    runs-on: ubuntu-latest
+    needs: meta
+    env:
+      GOOS: linux
+      GOARCH: amd64
+      CGO_ENABLED: "0"
+    steps:
+      - name: Set up Go (stable)
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: true
+
+      - name: Install xcaddy
+        shell: bash
+        run: |
+          set -euo pipefail
+          go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          xcaddy version || true
+
+      - name: Build Caddy (latest commit + modules)
+        shell: bash
+        env:
+          XCADDY_GO_BUILD_FLAGS: "-ldflags '-s -w'"
+        run: |
+          set -euo pipefail
+          mkdir -p release_assets
+
+          # clean binary name (no suffix)
+          OUT="release_assets/caddy"
+
+          xcaddy build "${{ needs.meta.outputs.caddy_sha_full }}" \
+            --output "${OUT}" \
+            --with github.com/mholt/caddy-l4 \
+            --with github.com/WeidiDeng/caddy-cloudflare-ip \
+            --with github.com/caddy-dns/cloudflare
+
+          chmod +x "${OUT}"
+
+          # tarball with traceable name; inside contains clean 'caddy'
+          (cd release_assets && tar -czf "${{ needs.meta.outputs.caddy_tar_name }}" caddy)
+
+          ls -lah release_assets
+
+      - name: Upload build artifacts (caddy)
+        uses: actions/upload-artifact@v4
+        with:
+          name: release_assets_caddy
+          path: release_assets/*
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [meta, build_dnscrypt, build_caddy]
+    steps:
+      - name: Download dnscrypt artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release_assets_dnscrypt
+          path: release_assets
+
+      - name: Download caddy artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release_assets_caddy
+          path: release_assets
+
+      - name: Generate checksums (SHA256SUMS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release_assets
 
           ls -lah
 
-      - name: Release notes (include upstream commit)
+          sha256sum \
+            dnscrypt-proxy \
+            caddy \
+            "${{ needs.meta.outputs.dns_tar_name }}" \
+            "${{ needs.meta.outputs.caddy_tar_name }}" \
+            > SHA256SUMS
+
+          cat SHA256SUMS
+
+      - name: Generate release notes
         shell: bash
         run: |
           set -euo pipefail
           cat > release_notes.md << 'EOF'
-          Build artifacts for dnscrypt-proxy (linux/amd64).
+          Custom build artifacts (linux/amd64):
 
-          - Upstream repo: DNSCrypt/dnscrypt-proxy
-          - Upstream commit: ${{ steps.meta.outputs.up_sha }}
+          - dnscrypt-proxy
+            - Upstream: DNSCrypt/dnscrypt-proxy
+            - Commit: ${{ needs.meta.outputs.dns_sha }}
+
+          - Caddy (xcaddy custom build)
+            - Upstream: caddyserver/caddy
+            - Commit: ${{ needs.meta.outputs.caddy_sha }}
+            - Modules:
+              - github.com/mholt/caddy-l4
+              - github.com/WeidiDeng/caddy-cloudflare-ip
+              - github.com/caddy-dns/cloudflare
 
           Verification (SHA256):
-          - Use the provided .sha256 files, e.g.:
-            sha256sum -c <file>.sha256
+          - sha256sum -c SHA256SUMS
           EOF
 
       - name: Create/Update GitHub Release and upload assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.meta.outputs.release_tag }}
-          name: dnscrypt-proxy ${{ steps.meta.outputs.version_label }} (up_${{ steps.meta.outputs.up_sha }})
-          target_commitish: ${{ github.sha }}
-          prerelease: ${{ steps.meta.outputs.is_prerelease == 'true' }}
-          draft: ${{ steps.meta.outputs.is_draft == 'true' }}
+          tag_name: ${{ needs.meta.outputs.release_tag }}
+          name: custom binaries ${{ needs.meta.outputs.version_label }} (dns_${{ needs.meta.outputs.dns_sha }}, caddy_${{ needs.meta.outputs.caddy_sha }})
+          prerelease: ${{ needs.meta.outputs.is_prerelease == 'true' }}
+          draft: ${{ needs.meta.outputs.is_draft == 'true' }}
           body_path: release_notes.md
+          overwrite_files: true
           files: |
-            src/dnscrypt-proxy/dist/${{ steps.meta.outputs.asset_base }}
-            src/dnscrypt-proxy/dist/${{ steps.meta.outputs.asset_base }}.sha256
-            src/dnscrypt-proxy/dist/${{ steps.meta.outputs.tar_name }}
-            src/dnscrypt-proxy/dist/${{ steps.meta.outputs.tar_name }}.sha256
+            release_assets/dnscrypt-proxy
+            release_assets/caddy
+            release_assets/${{ needs.meta.outputs.dns_tar_name }}
+            release_assets/${{ needs.meta.outputs.caddy_tar_name }}
+            release_assets/SHA256SUMS
