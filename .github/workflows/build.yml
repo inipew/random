@@ -14,11 +14,15 @@ on:
         description: "Tag release yang dibuat/diupdate (opsional). Kalau kosong & tag build, pakai tag itu. Kalau manual kosong, auto-generate."
         required: false
         default: ""
+      caddy_ref:
+        description: "Caddy ref (opsional): branch/tag/ref. Kosong = HEAD/latest. Jika commit, pakai full 40-hex."
+        required: false
+        default: ""
       goamd64:
         description: "GOAMD64 level (auto/v1/v2/v3/v4). auto = deteksi maksimum dari CPU runner."
         type: choice
         required: false
-        default: v2
+        default: v1
         options:
           - auto
           - v1
@@ -73,9 +77,52 @@ jobs:
           DNS_SHA_FULL="$(git -C src rev-parse HEAD)"
           DNS_SHA="${DNS_SHA_FULL:0:7}"
 
-          CADDY_SHA_FULL="$(git ls-remote https://github.com/caddyserver/caddy HEAD | awk '{print $1}')"
+          CADDY_REF_INPUT="${{ github.event.inputs.caddy_ref }}"
+          CADDY_REF_INPUT="${CADDY_REF_INPUT:-}"
+
+          resolve_caddy_commit() {
+            local ref="$1"
+            local sha=""
+
+            # empty => HEAD/latest
+            if [[ -z "$ref" ]]; then
+              sha="$(git ls-remote https://github.com/caddyserver/caddy HEAD | awk 'NR==1{print $1}')"
+              echo "$sha"
+              return
+            fi
+
+            # looks like a hash
+            if [[ "$ref" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+              if [[ "${#ref}" -lt 40 ]]; then
+                echo "ERROR: caddy_ref looks like a commit hash but is not full 40-hex. Use full commit SHA or a branch/tag." >&2
+                return 1
+              fi
+              echo "$ref"
+              return
+            fi
+
+            # branch/tag/ref -> resolve to commit (prefer peeled tag commit if available)
+            local candidates=()
+            if [[ "$ref" == refs/* ]]; then
+              candidates+=("$ref^{}" "$ref")
+            else
+              candidates+=("refs/tags/$ref^{}" "refs/tags/$ref" "refs/heads/$ref" "$ref")
+            fi
+
+            for c in "${candidates[@]}"; do
+              sha="$(git ls-remote https://github.com/caddyserver/caddy "$c" | awk 'NR==1{print $1}')"
+              if [[ -n "$sha" ]]; then
+                echo "$sha"
+                return
+              fi
+            done
+
+            echo ""
+          }
+
+          CADDY_SHA_FULL="$(resolve_caddy_commit "$CADDY_REF_INPUT")" || exit 1
           if [[ -z "${CADDY_SHA_FULL}" ]]; then
-            echo "Failed to resolve caddy HEAD commit" >&2
+            echo "Failed to resolve caddy ref '${CADDY_REF_INPUT:-HEAD}'" >&2
             exit 1
           fi
           CADDY_SHA="${CADDY_SHA_FULL:0:7}"
@@ -251,7 +298,7 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           xcaddy version || true
 
-      - name: Build Caddy (latest commit + modules)
+      - name: Build Caddy (ref/latest commit + modules)
         shell: bash
         env:
           XCADDY_GO_BUILD_FLAGS: "-ldflags '-s -w'"
