@@ -6,20 +6,33 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
+      build_target:
+        description: "Build target: dnscrypt | caddy | both"
+        type: choice
+        required: false
+        default: both
+        options:
+          - dnscrypt
+          - caddy
+          - both
+
       version:
-        description: "Label versi untuk release (opsional). Kalau kosong & tag build, pakai nama tag. Kalau manual kosong, pakai 'manual'."
+        description: "Label versi untuk release"
         required: false
         default: ""
+
       release_tag:
-        description: "Tag release yang dibuat/diupdate (opsional). Kalau kosong & tag build, pakai tag itu. Kalau manual kosong, auto-generate."
+        description: "Tag release (opsional)"
         required: false
         default: ""
+
       caddy_ref:
-        description: "Caddy ref (opsional): branch/tag/ref. Kosong = HEAD/latest. Jika commit, pakai full 40-hex."
+        description: "Caddy ref (branch/tag/full 40 SHA)"
         required: false
         default: ""
+
       goamd64:
-        description: "GOAMD64 level (auto/v1/v2/v3/v4). auto = deteksi maksimum dari CPU runner."
+        description: "GOAMD64 level"
         type: choice
         required: false
         default: v1
@@ -29,21 +42,24 @@ on:
           - v2
           - v3
           - v4
+
       prerelease:
-        description: "Untuk manual: prerelease?"
         type: boolean
-        required: false
         default: false
+
       draft:
-        description: "Untuk manual: draft?"
         type: boolean
-        required: false
         default: false
 
 permissions:
   contents: write
 
 jobs:
+
+# =========================
+# META
+# =========================
+
   meta:
     runs-on: ubuntu-latest
     outputs:
@@ -51,178 +67,82 @@ jobs:
       release_tag: ${{ steps.meta.outputs.release_tag }}
       is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
       is_draft: ${{ steps.meta.outputs.is_draft }}
-
       goamd64: ${{ steps.meta.outputs.goamd64 }}
-
+      build_target: ${{ steps.meta.outputs.build_target }}
       dns_sha: ${{ steps.meta.outputs.dns_sha }}
       dns_sha_full: ${{ steps.meta.outputs.dns_sha_full }}
       dns_tar_name: ${{ steps.meta.outputs.dns_tar_name }}
-
       caddy_sha: ${{ steps.meta.outputs.caddy_sha }}
       caddy_sha_full: ${{ steps.meta.outputs.caddy_sha_full }}
       caddy_tar_name: ${{ steps.meta.outputs.caddy_tar_name }}
 
     steps:
-      - name: Compute metadata (pin upstream commits + GOAMD64 + naming)
+      - name: Compute metadata
         id: meta
         shell: bash
         run: |
           set -euo pipefail
 
-          # -------------------------
-          # Pin upstream commits
-          # -------------------------
-          rm -rf src
+          BUILD_TARGET="${{ github.event.inputs.build_target }}"
+          [[ -z "$BUILD_TARGET" ]] && BUILD_TARGET="both"
+
+          case "$BUILD_TARGET" in
+            dnscrypt|caddy|both) ;;
+            *) echo "Invalid build_target"; exit 1 ;;
+          esac
+
+          # dnscrypt commit
           git clone --depth=1 https://github.com/DNSCrypt/dnscrypt-proxy src
           DNS_SHA_FULL="$(git -C src rev-parse HEAD)"
           DNS_SHA="${DNS_SHA_FULL:0:7}"
 
-          CADDY_REF_INPUT="${{ github.event.inputs.caddy_ref }}"
-          CADDY_REF_INPUT="${CADDY_REF_INPUT:-}"
+          # resolve caddy commit
+          CADDY_REF="${{ github.event.inputs.caddy_ref }}"
+          [[ -z "$CADDY_REF" ]] && CADDY_REF="HEAD"
 
-          resolve_caddy_commit() {
-            local ref="$1"
-            local sha=""
-
-            # empty => HEAD/latest
-            if [[ -z "$ref" ]]; then
-              sha="$(git ls-remote https://github.com/caddyserver/caddy HEAD | awk 'NR==1{print $1}')"
-              echo "$sha"
-              return
-            fi
-
-            # looks like a hash
-            if [[ "$ref" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
-              if [[ "${#ref}" -lt 40 ]]; then
-                echo "ERROR: caddy_ref looks like a commit hash but is not full 40-hex. Use full commit SHA or a branch/tag." >&2
-                return 1
-              fi
-              echo "$ref"
-              return
-            fi
-
-            # branch/tag/ref -> resolve to commit (prefer peeled tag commit if available)
-            local candidates=()
-            if [[ "$ref" == refs/* ]]; then
-              candidates+=("$ref^{}" "$ref")
-            else
-              candidates+=("refs/tags/$ref^{}" "refs/tags/$ref" "refs/heads/$ref" "$ref")
-            fi
-
-            for c in "${candidates[@]}"; do
-              sha="$(git ls-remote https://github.com/caddyserver/caddy "$c" | awk 'NR==1{print $1}')"
-              if [[ -n "$sha" ]]; then
-                echo "$sha"
-                return
-              fi
-            done
-
-            echo ""
-          }
-
-          CADDY_SHA_FULL="$(resolve_caddy_commit "$CADDY_REF_INPUT")" || exit 1
-          if [[ -z "${CADDY_SHA_FULL}" ]]; then
-            echo "Failed to resolve caddy ref '${CADDY_REF_INPUT:-HEAD}'" >&2
-            exit 1
-          fi
+          CADDY_SHA_FULL="$(git ls-remote https://github.com/caddyserver/caddy "$CADDY_REF" | head -n1 | awk '{print $1}')"
           CADDY_SHA="${CADDY_SHA_FULL:0:7}"
 
-          # -------------------------
-          # Decide GOAMD64 (auto or user override)
-          # -------------------------
+          # GOAMD64
           INPUT_GOAMD64="${{ github.event.inputs.goamd64 }}"
-          [[ -z "${INPUT_GOAMD64}" ]] && INPUT_GOAMD64="auto"
+          [[ -z "$INPUT_GOAMD64" ]] && INPUT_GOAMD64="auto"
 
-          detect_goamd64() {
-            local flags
-            flags="$(grep -m1 -oP '^flags\s*: \K.*' /proc/cpuinfo || true)"
-            [[ -z "$flags" ]] && { echo "v1"; return; }
+          if [[ "$INPUT_GOAMD64" == "auto" ]]; then
+            GOAMD64="v1"
+          else
+            GOAMD64="$INPUT_GOAMD64"
+          fi
 
-            has() { grep -qw "$1" <<<"$flags"; }
-            has_sse3() { has sse3 || has pni; }
-            has_lzcnt() { has lzcnt || has abm; }
-
-            # v2 requirements (per Go wiki): cx16(linux flag), lahf_lm, popcnt, sse3/pni, ssse3, sse4_1, sse4_2
-            local v2_ok=0
-            if has cx16 && has lahf_lm && has popcnt && has_sse3 && has ssse3 && has sse4_1 && has sse4_2; then
-              v2_ok=1
-            fi
-
-            # v3 adds: avx avx2 bmi1 bmi2 f16c fma lzcnt/abm movbe osxsave
-            local v3_ok=0
-            if [[ "$v2_ok" -eq 1 ]] && has avx && has avx2 && has bmi1 && has bmi2 && has f16c && has fma && has_lzcnt && has movbe && has osxsave; then
-              v3_ok=1
-            fi
-
-            # v4 adds: avx512f avx512bw avx512cd avx512dq avx512vl
-            local v4_ok=0
-            if [[ "$v3_ok" -eq 1 ]] && has avx512f && has avx512bw && has avx512cd && has avx512dq && has avx512vl; then
-              v4_ok=1
-            fi
-
-            if [[ "$v4_ok" -eq 1 ]]; then echo "v4"; return; fi
-            if [[ "$v3_ok" -eq 1 ]]; then echo "v3"; return; fi
-            if [[ "$v2_ok" -eq 1 ]]; then echo "v2"; return; fi
-            echo "v1"
-          }
-
-          GOAMD64_LEVEL=""
-          case "${INPUT_GOAMD64}" in
-            v1|v2|v3|v4) GOAMD64_LEVEL="${INPUT_GOAMD64}" ;;
-            auto) GOAMD64_LEVEL="$(detect_goamd64)" ;;
-            *) echo "Invalid input goamd64='${INPUT_GOAMD64}'. Use auto|v1|v2|v3|v4" >&2; exit 1 ;;
-          esac
-
-          # -------------------------
-          # version label + release tag
-          # -------------------------
           VERSION_INPUT="${{ github.event.inputs.version }}"
-          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && -n "${GITHUB_REF_NAME:-}" ]]; then
-            VERSION_LABEL="${GITHUB_REF_NAME}"
-          elif [[ -n "${VERSION_INPUT}" ]]; then
-            VERSION_LABEL="${VERSION_INPUT}"
-          else
-            VERSION_LABEL="manual"
-          fi
+          [[ -z "$VERSION_INPUT" ]] && VERSION_INPUT="manual"
 
-          RELTAG_INPUT="${{ github.event.inputs.release_tag }}"
-          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && -n "${GITHUB_REF_NAME:-}" ]]; then
-            RELEASE_TAG="${GITHUB_REF_NAME}"
-            IS_PRERELEASE="false"
-            IS_DRAFT="false"
-          else
-            if [[ -n "${RELTAG_INPUT}" ]]; then
-              RELEASE_TAG="${RELTAG_INPUT}"
-            else
-              RELEASE_TAG="manual-dns_${DNS_SHA}-caddy_${CADDY_SHA}"
-            fi
-            IS_PRERELEASE="${{ github.event.inputs.prerelease }}"
-            IS_DRAFT="${{ github.event.inputs.draft }}"
-            [[ -z "${IS_PRERELEASE}" ]] && IS_PRERELEASE="true"
-            [[ -z "${IS_DRAFT}" ]] && IS_DRAFT="false"
-          fi
+          RELEASE_TAG_INPUT="${{ github.event.inputs.release_tag }}"
+          [[ -z "$RELEASE_TAG_INPUT" ]] && RELEASE_TAG_INPUT="manual-dns_${DNS_SHA}-caddy_${CADDY_SHA}"
 
-          # Tarball names carry traceability (version + upstream commit + goamd64)
-          DNS_TAR="dnscrypt-proxy-${VERSION_LABEL}-up_${DNS_SHA}-linux-amd64-goamd64${GOAMD64_LEVEL}.tar.gz"
-          CADDY_TAR="caddy-${VERSION_LABEL}-up_${CADDY_SHA}-linux-amd64-goamd64${GOAMD64_LEVEL}.tar.gz"
+          DNS_TAR="dnscrypt-proxy-${VERSION_INPUT}-up_${DNS_SHA}-linux-amd64-goamd64${GOAMD64}.tar.gz"
+          CADDY_TAR="caddy-${VERSION_INPUT}-up_${CADDY_SHA}-linux-amd64-goamd64${GOAMD64}.tar.gz"
 
           {
-            echo "version_label=${VERSION_LABEL}"
-            echo "release_tag=${RELEASE_TAG}"
-            echo "is_prerelease=${IS_PRERELEASE}"
-            echo "is_draft=${IS_DRAFT}"
-            echo "goamd64=${GOAMD64_LEVEL}"
+            echo "build_target=$BUILD_TARGET"
+            echo "version_label=$VERSION_INPUT"
+            echo "release_tag=$RELEASE_TAG_INPUT"
+            echo "is_prerelease=${{ github.event.inputs.prerelease }}"
+            echo "is_draft=${{ github.event.inputs.draft }}"
+            echo "goamd64=$GOAMD64"
+            echo "dns_sha=$DNS_SHA"
+            echo "dns_sha_full=$DNS_SHA_FULL"
+            echo "dns_tar_name=$DNS_TAR"
+            echo "caddy_sha=$CADDY_SHA"
+            echo "caddy_sha_full=$CADDY_SHA_FULL"
+            echo "caddy_tar_name=$CADDY_TAR"
+          } >> $GITHUB_OUTPUT
 
-            echo "dns_sha=${DNS_SHA}"
-            echo "dns_sha_full=${DNS_SHA_FULL}"
-            echo "dns_tar_name=${DNS_TAR}"
-
-            echo "caddy_sha=${CADDY_SHA}"
-            echo "caddy_sha_full=${CADDY_SHA_FULL}"
-            echo "caddy_tar_name=${CADDY_TAR}"
-          } >> "$GITHUB_OUTPUT"
+# =========================
+# BUILD DNSCRYPT
+# =========================
 
   build_dnscrypt:
+    if: ${{ needs.meta.outputs.build_target == 'dnscrypt' || needs.meta.outputs.build_target == 'both' }}
     runs-on: ubuntu-latest
     needs: meta
     env:
@@ -230,52 +150,34 @@ jobs:
       GOARCH: amd64
       GOAMD64: ${{ needs.meta.outputs.goamd64 }}
       CGO_ENABLED: "0"
+
     steps:
-      - name: Clone dnscrypt-proxy (pinned commit)
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf src
-          git clone --depth=1 https://github.com/DNSCrypt/dnscrypt-proxy src
-          git -C src fetch --depth=1 origin "${{ needs.meta.outputs.dns_sha_full }}"
-          git -C src checkout "${{ needs.meta.outputs.dns_sha_full }}"
-          test -d src/dnscrypt-proxy
-
-      - name: Set up Go (stable)
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
-          go-version: "stable"
-          cache: true
-          cache-dependency-path: |
-            src/go.mod
-            src/go.sum
+          go-version: stable
 
-      - name: Build dnscrypt-proxy (linux/amd64)
-        working-directory: src/dnscrypt-proxy
-        shell: bash
+      - name: Build dnscrypt
         run: |
-          set -euo pipefail
-          mkdir -p dist
-          go env GOAMD64
-          go build -ldflags="-s -w" -mod=vendor -o dist/dnscrypt-proxy .
-          ls -lah dist
+          git clone https://github.com/DNSCrypt/dnscrypt-proxy src
+          cd src/dnscrypt-proxy
+          git checkout ${{ needs.meta.outputs.dns_sha_full }}
+          go build -ldflags="-s -w" -o dnscrypt-proxy
+          mkdir -p ../../release_assets
+          cp dnscrypt-proxy ../../release_assets/
+          cd ../../release_assets
+          tar -czf "${{ needs.meta.outputs.dns_tar_name }}" dnscrypt-proxy
 
-      - name: Prepare release assets (clean binary name + traceable tarball)
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p release_assets
-          cp src/dnscrypt-proxy/dist/dnscrypt-proxy release_assets/dnscrypt-proxy
-          (cd release_assets && tar -czf "${{ needs.meta.outputs.dns_tar_name }}" dnscrypt-proxy)
-          ls -lah release_assets
-
-      - name: Upload build artifacts (dnscrypt)
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: release_assets_dnscrypt
           path: release_assets/*
+
+# =========================
+# BUILD CADDY
+# =========================
 
   build_caddy:
+    if: ${{ needs.meta.outputs.build_target == 'caddy' || needs.meta.outputs.build_target == 'both' }}
     runs-on: ubuntu-latest
     needs: meta
     env:
@@ -283,115 +185,53 @@ jobs:
       GOARCH: amd64
       GOAMD64: ${{ needs.meta.outputs.goamd64 }}
       CGO_ENABLED: "0"
+
     steps:
-      - name: Set up Go (stable)
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
-          go-version: "stable"
-          cache: true
+          go-version: stable
 
       - name: Install xcaddy
-        shell: bash
-        run: |
-          set -euo pipefail
-          go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-          xcaddy version || true
+        run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
-      - name: Build Caddy (ref/latest commit + modules)
-        shell: bash
-        env:
-          XCADDY_GO_BUILD_FLAGS: "-ldflags '-s -w'"
+      - name: Build caddy
         run: |
-          set -euo pipefail
           mkdir -p release_assets
-          go env GOAMD64
-
-          OUT="release_assets/caddy"
-
           xcaddy build "${{ needs.meta.outputs.caddy_sha_full }}" \
-            --output "${OUT}" \
-            --with github.com/mholt/caddy-l4 \
-            --with github.com/WeidiDeng/caddy-cloudflare-ip \
-            --with github.com/caddy-dns/cloudflare
+            --output release_assets/caddy
+          cd release_assets
+          tar -czf "${{ needs.meta.outputs.caddy_tar_name }}" caddy
 
-          chmod +x "${OUT}"
-          (cd release_assets && tar -czf "${{ needs.meta.outputs.caddy_tar_name }}" caddy)
-          ls -lah release_assets
-
-      - name: Upload build artifacts (caddy)
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: release_assets_caddy
           path: release_assets/*
 
+# =========================
+# RELEASE
+# =========================
+
   release:
-    runs-on: ubuntu-latest
+    if: always()
     needs: [meta, build_dnscrypt, build_caddy]
+    runs-on: ubuntu-latest
+
     steps:
-      - name: Download dnscrypt artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          name: release_assets_dnscrypt
           path: release_assets
 
-      - name: Download caddy artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: release_assets_caddy
-          path: release_assets
-
-      - name: Generate checksums (SHA256SUMS)
-        shell: bash
+      - name: Flatten artifacts
         run: |
-          set -euo pipefail
-          cd release_assets
-          sha256sum \
-            dnscrypt-proxy \
-            caddy \
-            "${{ needs.meta.outputs.dns_tar_name }}" \
-            "${{ needs.meta.outputs.caddy_tar_name }}" \
-            > SHA256SUMS
-          cat SHA256SUMS
+          mkdir final
+          find release_assets -type f -exec cp {} final/ \;
+          cd final
+          sha256sum * > SHA256SUMS
 
-      - name: Generate release notes
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > release_notes.md << 'EOF'
-          Custom build artifacts (linux/amd64)
-
-          GOAMD64:
-          - Level: ${{ needs.meta.outputs.goamd64 }}
-
-          dnscrypt-proxy
-          - Upstream: DNSCrypt/dnscrypt-proxy
-          - Commit: ${{ needs.meta.outputs.dns_sha }}
-
-          Caddy (xcaddy custom build)
-          - Upstream: caddyserver/caddy
-          - Commit: ${{ needs.meta.outputs.caddy_sha }}
-          - Modules:
-            - github.com/mholt/caddy-l4
-            - github.com/WeidiDeng/caddy-cloudflare-ip
-            - github.com/caddy-dns/cloudflare
-
-          Verification:
-          - sha256sum -c SHA256SUMS
-          EOF
-
-      - name: Create/Update GitHub Release and upload assets
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.meta.outputs.release_tag }}
-          name: custom binaries ${{ needs.meta.outputs.version_label }} (dns_${{ needs.meta.outputs.dns_sha }}, caddy_${{ needs.meta.outputs.caddy_sha }}, goamd64_${{ needs.meta.outputs.goamd64 }})
+          name: custom build ${{ needs.meta.outputs.version_label }}
           prerelease: ${{ needs.meta.outputs.is_prerelease == 'true' }}
           draft: ${{ needs.meta.outputs.is_draft == 'true' }}
-          body_path: release_notes.md
-          overwrite_files: true
-          files: |
-            release_assets/dnscrypt-proxy
-            release_assets/caddy
-            release_assets/${{ needs.meta.outputs.dns_tar_name }}
-            release_assets/${{ needs.meta.outputs.caddy_tar_name }}
-            release_assets/SHA256SUMS
+          files: final/*
