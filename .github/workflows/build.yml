@@ -1,4 +1,4 @@
-name: build-dnscrypt-proxy-caddy-and-usque
+name: build-dnscrypt-proxy-caddy-usque-and-singbox
 
 on:
   push:
@@ -8,10 +8,10 @@ on:
   workflow_dispatch:
     inputs:
       build_target:
-        description: "dnscrypt | caddy | usque | both | all"
+        description: "dnscrypt | caddy | usque | singbox | both | all"
         type: choice
         default: all
-        options: [dnscrypt, caddy, usque, both, all]
+        options: [dnscrypt, caddy, usque, singbox, both, all]
 
       version:
         description: "Version label"
@@ -29,10 +29,20 @@ on:
         description: "Usque branch/tag/full SHA"
         required: false
 
+      singbox_ref:
+        description: "Sing-box branch/tag/full SHA"
+        required: false
+        default: "ref1nd"
+
+      singbox_tags:
+        description: "Sing-box Go build tags"
+        required: false
+        default: "with_warp,with_gvisor,with_dhcp,with_wireguard,with_clash_api,with_quic,with_utls,badlinkname,tfogo_checklinkname0"
+
       goamd64:
         description: "GOAMD64 level"
         type: choice
-        default: auto
+        default: v3
         options: [auto, v1, v2, v3, v4]
 
       prerelease:
@@ -63,9 +73,11 @@ jobs:
       dns_sha: ${{ steps.meta.outputs.dns_sha }}
       caddy_sha: ${{ steps.meta.outputs.caddy_sha }}
       usque_sha: ${{ steps.meta.outputs.usque_sha }}
+      singbox_sha: ${{ steps.meta.outputs.singbox_sha }}
       dns_tar: ${{ steps.meta.outputs.dns_tar }}
       caddy_tar: ${{ steps.meta.outputs.caddy_tar }}
       usque_tar: ${{ steps.meta.outputs.usque_tar }}
+      singbox_tar: ${{ steps.meta.outputs.singbox_tar }}
 
     steps:
       - id: meta
@@ -92,6 +104,12 @@ jobs:
           USQUE_SHA_FULL="$(git ls-remote https://github.com/inipew/usque "$USQUE_REF" | head -n1 | awk '{print $1}')"
           USQUE_SHA="${USQUE_SHA_FULL:0:7}"
 
+          # Resolve singbox commit (no clone)
+          SINGBOX_REF="${{ github.event.inputs.singbox_ref }}"
+          [[ -z "$SINGBOX_REF" ]] && SINGBOX_REF="ref1nd"
+          SINGBOX_SHA_FULL="$(git ls-remote https://github.com/inipew/sing-box "$SINGBOX_REF" | head -n1 | awk '{print $1}')"
+          SINGBOX_SHA="${SINGBOX_SHA_FULL:0:7}"
+
           # GOAMD64
           INPUT_GOAMD64="${{ github.event.inputs.goamd64 }}"
           if [[ "$INPUT_GOAMD64" == "auto" || -z "$INPUT_GOAMD64" ]]; then
@@ -104,11 +122,12 @@ jobs:
           [[ -z "$VERSION" ]] && VERSION="manual"
 
           RELEASE_TAG="${{ github.event.inputs.release_tag }}"
-          [[ -z "$RELEASE_TAG" ]] && RELEASE_TAG="manual-dns_${DNS_SHA}-caddy_${CADDY_SHA}-usque_${USQUE_SHA}"
+          [[ -z "$RELEASE_TAG" ]] && RELEASE_TAG="manual-dns_${DNS_SHA}-caddy_${CADDY_SHA}-usque_${USQUE_SHA}-singbox_${SINGBOX_SHA}"
 
           DNS_TAR="dnscrypt-${VERSION}-up_${DNS_SHA}-goamd64${GOAMD64}.tar.gz"
           CADDY_TAR="caddy-${VERSION}-up_${CADDY_SHA}-goamd64${GOAMD64}.tar.gz"
           USQUE_TAR="usque-${VERSION}-up_${USQUE_SHA}-goamd64${GOAMD64}.tar.gz"
+          SINGBOX_TAR="sing-box-${VERSION}-up_${SINGBOX_SHA}-goamd64v3.tar.gz"
 
           {
             echo "build_target=$BUILD_TARGET"
@@ -120,9 +139,11 @@ jobs:
             echo "dns_sha=$DNS_SHA_FULL"
             echo "caddy_sha=$CADDY_SHA_FULL"
             echo "usque_sha=$USQUE_SHA_FULL"
+            echo "singbox_sha=$SINGBOX_SHA_FULL"
             echo "dns_tar=$DNS_TAR"
             echo "caddy_tar=$CADDY_TAR"
             echo "usque_tar=$USQUE_TAR"
+            echo "singbox_tar=$SINGBOX_TAR"
           } >> $GITHUB_OUTPUT
 
 # =========================================================
@@ -164,6 +185,11 @@ jobs:
           cd ../../release
           tar -czf "${{ needs.meta.outputs.dns_tar }}" dnscrypt-proxy
 
+      - name: Smoke test
+        run: |
+          chmod +x release/dnscrypt-proxy
+          release/dnscrypt-proxy --version
+
       - uses: actions/upload-artifact@v4
         with:
           name: dnscrypt
@@ -202,6 +228,11 @@ jobs:
             --with github.com/caddy-dns/cloudflare
           cd release
           tar -czf "${{ needs.meta.outputs.caddy_tar }}" caddy
+
+      - name: Smoke test
+        run: |
+          chmod +x release/caddy
+          release/caddy version
 
       - uses: actions/upload-artifact@v4
         with:
@@ -247,9 +278,111 @@ jobs:
           cd ../release
           tar -czf "${{ needs.meta.outputs.usque_tar }}" usque
 
+      - name: Smoke test
+        run: |
+          chmod +x release/usque
+          release/usque --help
+
       - uses: actions/upload-artifact@v4
         with:
           name: usque
+          path: release/*
+
+# =========================================================
+# SINGBOX BUILD (only if needed)
+# =========================================================
+
+  build_singbox:
+    if: ${{ needs.meta.outputs.build_target == 'singbox' || needs.meta.outputs.build_target == 'all' }}
+    needs: meta
+    runs-on: ubuntu-latest
+
+    env:
+      GOOS: linux
+      GOARCH: amd64
+      GOAMD64: v3
+      CGO_ENABLED: "1"
+      CC: clang
+      CXX: clang++
+      GOFLAGS: -buildvcs=false
+      GOMODCACHE: /home/runner/go/pkg/mod
+      GOCACHE: /home/runner/.cache/go-build
+      GOPROXY: https://proxy.golang.org,direct
+      GOSUMDB: sum.golang.org
+
+    steps:
+      - name: Clone specific commit
+        run: |
+          git init src
+          cd src
+          git remote add origin https://github.com/inipew/sing-box
+          git fetch --depth=1 origin "${{ needs.meta.outputs.singbox_sha }}"
+          git checkout FETCH_HEAD
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+          cache-dependency-path: src/go.sum
+
+      - name: Set week number
+        run: echo "WEEK=$(date +'%G-%V')" >> "$GITHUB_ENV"
+
+      - name: Cache gotip (weekly)
+        id: cache-gotip
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/bin/gotip
+            ~/sdk/gotip
+          key: ${{ runner.os }}-gotip-${{ env.WEEK }}
+          restore-keys: ${{ runner.os }}-gotip-
+
+      - name: Install / update gotip
+        run: |
+          GOTIP="$HOME/go/bin/gotip"
+          [[ ! -x "$GOTIP" ]] && go install golang.org/dl/gotip@latest
+          if [[ "${{ steps.cache-gotip.outputs.cache-hit }}" != "true" || ! -d "$HOME/sdk/gotip" ]]; then
+            echo "Cache miss — downloading gotip toolchain…"
+            "$GOTIP" download
+          fi
+          "$GOTIP" version
+
+      - name: Cache Go build artifacts
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.GOCACHE }}
+          key: ${{ runner.os }}-gobuild-singbox-${{ hashFiles('src/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-gobuild-singbox-
+
+      - name: Build binary
+        run: |
+          cd src
+          START=$(date +%s)
+          ~/go/bin/gotip build -v -trimpath \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.meta.outputs.version_label }}' -s -w -buildid= -checklinkname=0" \
+            -tags "${{ github.event.inputs.singbox_tags || 'with_gvisor,with_dhcp,with_wireguard,with_clash_api,with_quic,with_utls,badlinkname,tfogo_checklinkname0' }}" \
+            -o sing-box \
+            ./cmd/sing-box
+
+          [[ ! -f ./sing-box ]] && { echo "::error::Binary not produced"; exit 1; }
+          SIZE=$(stat -c%s ./sing-box)
+          echo "::notice::Built in $(($(date +%s)-START))s — ${SIZE} bytes"
+          
+          mkdir -p ../release
+          cp sing-box ../release/
+          cd ../release
+          tar -czf "${{ needs.meta.outputs.singbox_tar }}" sing-box
+
+      - name: Smoke test
+        run: |
+          chmod +x release/sing-box
+          release/sing-box version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: singbox
           path: release/*
 
 # =========================================================
@@ -258,7 +391,7 @@ jobs:
 
   release:
     if: ${{ !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
-    needs: [meta, build_dnscrypt, build_caddy, build_usque]
+    needs: [meta, build_dnscrypt, build_caddy, build_usque, build_singbox]
     runs-on: ubuntu-latest
 
     steps:
@@ -293,6 +426,12 @@ jobs:
           if ls final/usque* 1>/dev/null 2>&1; then
             echo "### Usque" >> notes.md
             echo "- Commit: ${{ needs.meta.outputs.usque_sha }}" >> notes.md
+            echo "" >> notes.md
+          fi
+
+          if ls final/sing-box* 1>/dev/null 2>&1; then
+            echo "### Sing-box" >> notes.md
+            echo "- Commit: ${{ needs.meta.outputs.singbox_sha }}" >> notes.md
             echo "" >> notes.md
           fi
 
