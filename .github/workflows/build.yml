@@ -1,4 +1,4 @@
-name: build-dnscrypt-proxy-and-caddy
+name: build-dnscrypt-proxy-caddy-and-usque
 
 on:
   push:
@@ -8,10 +8,10 @@ on:
   workflow_dispatch:
     inputs:
       build_target:
-        description: "dnscrypt | caddy | both"
+        description: "dnscrypt | caddy | usque | both | all"
         type: choice
-        default: both
-        options: [dnscrypt, caddy, both]
+        default: all
+        options: [dnscrypt, caddy, usque, both, all]
 
       version:
         description: "Version label"
@@ -23,6 +23,10 @@ on:
 
       caddy_ref:
         description: "Caddy branch/tag/full SHA"
+        required: false
+
+      usque_ref:
+        description: "Usque branch/tag/full SHA"
         required: false
 
       goamd64:
@@ -58,8 +62,10 @@ jobs:
       draft: ${{ steps.meta.outputs.draft }}
       dns_sha: ${{ steps.meta.outputs.dns_sha }}
       caddy_sha: ${{ steps.meta.outputs.caddy_sha }}
+      usque_sha: ${{ steps.meta.outputs.usque_sha }}
       dns_tar: ${{ steps.meta.outputs.dns_tar }}
       caddy_tar: ${{ steps.meta.outputs.caddy_tar }}
+      usque_tar: ${{ steps.meta.outputs.usque_tar }}
 
     steps:
       - id: meta
@@ -68,7 +74,7 @@ jobs:
           set -euo pipefail
 
           BUILD_TARGET="${{ github.event.inputs.build_target }}"
-          [[ -z "$BUILD_TARGET" ]] && BUILD_TARGET="both"
+          [[ -z "$BUILD_TARGET" ]] && BUILD_TARGET="all"
 
           # Resolve latest dnscrypt commit (no clone)
           DNS_SHA_FULL="$(git ls-remote https://github.com/DNSCrypt/dnscrypt-proxy HEAD | awk '{print $1}')"
@@ -79,6 +85,12 @@ jobs:
           [[ -z "$CADDY_REF" ]] && CADDY_REF="HEAD"
           CADDY_SHA_FULL="$(git ls-remote https://github.com/caddyserver/caddy "$CADDY_REF" | head -n1 | awk '{print $1}')"
           CADDY_SHA="${CADDY_SHA_FULL:0:7}"
+
+          # Resolve usque commit (no clone)
+          USQUE_REF="${{ github.event.inputs.usque_ref }}"
+          [[ -z "$USQUE_REF" ]] && USQUE_REF="HEAD"
+          USQUE_SHA_FULL="$(git ls-remote https://github.com/inipew/usque "$USQUE_REF" | head -n1 | awk '{print $1}')"
+          USQUE_SHA="${USQUE_SHA_FULL:0:7}"
 
           # GOAMD64
           INPUT_GOAMD64="${{ github.event.inputs.goamd64 }}"
@@ -92,10 +104,11 @@ jobs:
           [[ -z "$VERSION" ]] && VERSION="manual"
 
           RELEASE_TAG="${{ github.event.inputs.release_tag }}"
-          [[ -z "$RELEASE_TAG" ]] && RELEASE_TAG="manual-dns_${DNS_SHA}-caddy_${CADDY_SHA}"
+          [[ -z "$RELEASE_TAG" ]] && RELEASE_TAG="manual-dns_${DNS_SHA}-caddy_${CADDY_SHA}-usque_${USQUE_SHA}"
 
           DNS_TAR="dnscrypt-${VERSION}-up_${DNS_SHA}-goamd64${GOAMD64}.tar.gz"
           CADDY_TAR="caddy-${VERSION}-up_${CADDY_SHA}-goamd64${GOAMD64}.tar.gz"
+          USQUE_TAR="usque-${VERSION}-up_${USQUE_SHA}-goamd64${GOAMD64}.tar.gz"
 
           {
             echo "build_target=$BUILD_TARGET"
@@ -106,8 +119,10 @@ jobs:
             echo "draft=${{ github.event.inputs.draft }}"
             echo "dns_sha=$DNS_SHA_FULL"
             echo "caddy_sha=$CADDY_SHA_FULL"
+            echo "usque_sha=$USQUE_SHA_FULL"
             echo "dns_tar=$DNS_TAR"
             echo "caddy_tar=$CADDY_TAR"
+            echo "usque_tar=$USQUE_TAR"
           } >> $GITHUB_OUTPUT
 
 # =========================================================
@@ -115,7 +130,7 @@ jobs:
 # =========================================================
 
   build_dnscrypt:
-    if: ${{ needs.meta.outputs.build_target == 'dnscrypt' || needs.meta.outputs.build_target == 'both' }}
+    if: ${{ needs.meta.outputs.build_target == 'dnscrypt' || needs.meta.outputs.build_target == 'both' || needs.meta.outputs.build_target == 'all' }}
     needs: meta
     runs-on: ubuntu-latest
 
@@ -126,16 +141,19 @@ jobs:
       CGO_ENABLED: "0"
 
     steps:
+      - name: Clone specific commit
+        run: |
+          git init src
+          cd src
+          git remote add origin https://github.com/DNSCrypt/dnscrypt-proxy
+          git fetch --depth=1 origin "${{ needs.meta.outputs.dns_sha }}"
+          git checkout FETCH_HEAD
+
       - uses: actions/setup-go@v5
         with:
           go-version: stable
           cache: true
-
-      - name: Clone specific commit
-        run: |
-          git clone --depth=1 https://github.com/DNSCrypt/dnscrypt-proxy src
-          git -C src fetch --depth=1 origin "${{ needs.meta.outputs.dns_sha }}"
-          git -C src checkout "${{ needs.meta.outputs.dns_sha }}"
+          cache-dependency-path: src/dnscrypt-proxy/go.sum
 
       - name: Build
         run: |
@@ -156,7 +174,7 @@ jobs:
 # =========================================================
 
   build_caddy:
-    if: ${{ needs.meta.outputs.build_target == 'caddy' || needs.meta.outputs.build_target == 'both' }}
+    if: ${{ needs.meta.outputs.build_target == 'caddy' || needs.meta.outputs.build_target == 'both' || needs.meta.outputs.build_target == 'all' }}
     needs: meta
     runs-on: ubuntu-latest
 
@@ -191,12 +209,56 @@ jobs:
           path: release/*
 
 # =========================================================
+# USQUE BUILD (only if needed)
+# =========================================================
+
+  build_usque:
+    if: ${{ needs.meta.outputs.build_target == 'usque' || needs.meta.outputs.build_target == 'all' }}
+    needs: meta
+    runs-on: ubuntu-latest
+
+    env:
+      GOOS: linux
+      GOARCH: amd64
+      GOAMD64: ${{ needs.meta.outputs.goamd64 }}
+      CGO_ENABLED: "0"
+
+    steps:
+      - name: Clone specific commit
+        run: |
+          git init src
+          cd src
+          git remote add origin https://github.com/inipew/usque
+          git fetch --depth=1 origin "${{ needs.meta.outputs.usque_sha }}"
+          git checkout FETCH_HEAD
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+          cache-dependency-path: src/go.sum
+
+      - name: Build
+        run: |
+          cd src
+          go build -trimpath -ldflags="-s -w" -o usque
+          mkdir -p ../release
+          cp usque ../release/
+          cd ../release
+          tar -czf "${{ needs.meta.outputs.usque_tar }}" usque
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: usque
+          path: release/*
+
+# =========================================================
 # RELEASE
 # =========================================================
 
   release:
-    if: always()
-    needs: [meta, build_dnscrypt, build_caddy]
+    if: ${{ !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    needs: [meta, build_dnscrypt, build_caddy, build_usque]
     runs-on: ubuntu-latest
 
     steps:
@@ -228,10 +290,16 @@ jobs:
             echo "" >> notes.md
           fi
 
+          if ls final/usque* 1>/dev/null 2>&1; then
+            echo "### Usque" >> notes.md
+            echo "- Commit: ${{ needs.meta.outputs.usque_sha }}" >> notes.md
+            echo "" >> notes.md
+          fi
+
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.meta.outputs.release_tag }}
-          name: custom build ${{ needs.meta.outputs.version_label }}
+          tag_name: latest
+          name: "Latest Release"
           body_path: notes.md
           prerelease: ${{ needs.meta.outputs.prerelease == 'true' }}
           draft: ${{ needs.meta.outputs.draft == 'true' }}
