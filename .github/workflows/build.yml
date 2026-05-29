@@ -230,8 +230,8 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.meta.outputs.release_tag }}
-          name: custom build ${{ needs.meta.outputs.version_label }}
+          tag_name: latest
+          name: "Latest Release"
           body_path: notes.md
           prerelease: ${{ needs.meta.outputs.prerelease == 'true' }}
           draft: ${{ needs.meta.outputs.draft == 'true' }}
